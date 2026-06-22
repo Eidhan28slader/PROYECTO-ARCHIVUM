@@ -1,22 +1,25 @@
 import os
 import time
+
 import boto3
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from db import get_session
 from models import Comentario, Publicacion, PublicacionCreate, PublicacionUpdate, Usuario
+from app.etica import validar_texto_etico
+
 
 router = APIRouter(prefix="/publicaciones", tags=["publicaciones"])
 
-# Inicializar el cliente de AWS S3 usando las variables de entorno del .env
+
 s3_client = None
 try:
     s3_client = boto3.client(
-        's3',
-        region_name=os.getenv('AWS_REGION'),
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+        "s3",
+        region_name=os.getenv("AWS_REGION"),
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
     )
 except Exception as e:
     print(f"Advertencia: No se pudo conectar a AWS S3: {e}")
@@ -38,47 +41,37 @@ def publicacion_con_usuario(publicacion: Publicacion, session: Session):
     }
 
 
-# ==========================================
-# NUEVA RUTA: GENERAR URL FIRMADA PARA AWS S3
-# ==========================================
 @router.get("/obtener-url-subida")
 def obtener_url_subida():
     if not s3_client:
         raise HTTPException(status_code=503, detail="Servicio de almacenamiento no disponible")
-    
-    bucket_name = os.getenv('AWS_BUCKET_NAME')
+
+    bucket_name = os.getenv("AWS_BUCKET_NAME")
     if not bucket_name:
         raise HTTPException(status_code=500, detail="Falta configurar las variables de entorno de AWS")
-        
-    # Generamos un nombre único usando timestamp para evitar que se pisen imágenes
+
     nombre_archivo = f"pin-{int(time.time())}.jpg"
-    
+
     try:
-        # Generar la URL firmada (vence en 3 minutos)
         url_firmada = s3_client.generate_presigned_url(
-            'put_object',
+            "put_object",
             Params={
-                'Bucket': bucket_name,
-                'Key': nombre_archivo,
-                'ContentType': 'image/jpeg'
+                "Bucket": bucket_name,
+                "Key": nombre_archivo,
+                "ContentType": "image/jpeg",
             },
-            ExpiresIn=180
+            ExpiresIn=180,
         )
-        
-        # URL final con la que los demás usuarios verán la foto en el feed
+
         url_final_imagen = f"https://{bucket_name}.s3.{os.getenv('AWS_REGION')}.amazonaws.com/{nombre_archivo}"
-        
+
         return {
             "urlFirmada": url_firmada,
-            "urlFinalImagen": url_final_imagen
+            "urlFinalImagen": url_final_imagen,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al conectar con AWS S3: {str(e)}")
 
-
-# ==========================================
-# RUTAS ORIGINALES DE TU CRUD
-# ==========================================
 
 @router.get("/")
 def get_publicaciones(session: Session = Depends(get_session)):
@@ -92,7 +85,10 @@ def create_publicacion(publicacion: PublicacionCreate, session: Session = Depend
     if not usuario:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
+    validar_texto_etico(publicacion.titulo, publicacion.descripcion)
+
     datos = publicacion.model_dump()
+
     if not datos.get("imagen_url"):
         datos["imagen_url"] = "https://picsum.photos/400/300?random=999"
 
@@ -100,6 +96,7 @@ def create_publicacion(publicacion: PublicacionCreate, session: Session = Depend
     session.add(nueva_publicacion)
     session.commit()
     session.refresh(nueva_publicacion)
+
     return publicacion_con_usuario(nueva_publicacion, session)
 
 
@@ -110,8 +107,11 @@ def get_publicaciones_by_usuario(usuario_id: int, session: Session = Depends(get
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
     publicaciones = session.exec(
-        select(Publicacion).where(Publicacion.usuario_id == usuario_id).order_by(Publicacion.id.desc())
+        select(Publicacion)
+        .where(Publicacion.usuario_id == usuario_id)
+        .order_by(Publicacion.id.desc())
     ).all()
+
     return [publicacion_con_usuario(publicacion, session) for publicacion in publicaciones]
 
 
@@ -120,6 +120,7 @@ def get_publicacion_by_id(id: int, session: Session = Depends(get_session)):
     publicacion = session.get(Publicacion, id)
     if not publicacion:
         raise HTTPException(status_code=404, detail="Publicación no encontrada")
+
     return publicacion_con_usuario(publicacion, session)
 
 
@@ -130,6 +131,12 @@ def update_publicacion(id: int, cambios: PublicacionUpdate, session: Session = D
         raise HTTPException(status_code=404, detail="Publicación no encontrada")
 
     datos = cambios.model_dump(exclude_unset=True)
+
+    validar_texto_etico(
+        datos.get("titulo", publicacion.titulo),
+        datos.get("descripcion", publicacion.descripcion),
+    )
+
     for campo, valor in datos.items():
         if valor is not None and str(valor).strip() != "":
             setattr(publicacion, campo, valor)
@@ -137,14 +144,21 @@ def update_publicacion(id: int, cambios: PublicacionUpdate, session: Session = D
     session.add(publicacion)
     session.commit()
     session.refresh(publicacion)
+
     return publicacion_con_usuario(publicacion, session)
 
 
 @router.delete("/{id}")
-def delete_publicacion(id: int, session: Session = Depends(get_session)):
+def delete_publicacion(id: int, usuario_id: int, session: Session = Depends(get_session)):
     publicacion = session.get(Publicacion, id)
     if not publicacion:
         raise HTTPException(status_code=404, detail="Publicación no encontrada")
+
+    if publicacion.usuario_id != usuario_id:
+        raise HTTPException(
+            status_code=403,
+            detail="No puedes eliminar publicaciones de otro usuario.",
+        )
 
     comentarios = session.exec(select(Comentario).where(Comentario.publicacion_id == id)).all()
     for comentario in comentarios:
@@ -152,4 +166,5 @@ def delete_publicacion(id: int, session: Session = Depends(get_session)):
 
     session.delete(publicacion)
     session.commit()
+
     return {"message": "Publicación eliminada correctamente"}
