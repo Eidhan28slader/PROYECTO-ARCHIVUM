@@ -59,3 +59,17 @@ class ComentarioCreate(SQLModel):
     autor: str
     contenido: str
     publicacion_id: int
+
+
+class Denuncia(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    publicacion_id: int = Field(foreign_key="publicacion.id")
+    usuario_id: int = Field(foreign_key="usuario.id")
+    motivo: str
+    estado: str = "pendiente"
+
+
+class DenunciaCreate(SQLModel):
+    publicacion_id: int
+    usuario_id: int
+    motivo: str
